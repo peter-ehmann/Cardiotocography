@@ -1,0 +1,1338 @@
+---
+title: "stat534code_ehmann"
+author: "Peter J. Ehmann"
+date: "12/11/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# MSDS 534 Final Project
+
+<br>
+
+```{r zero.0, message=FALSE, warning=FALSE}
+library(dplyr)
+library(e1071)
+library(gbm)
+library(ggplot2)
+library(glmnet)
+library(httr)
+library(knitr)
+library(nnet)
+library(pdp)
+library(randomForest)
+library(readxl)
+library(stats)
+library(tidyr)
+library(vip)
+set.seed(123)
+```
+
+<br>
+
+##### The dataset for this project comes from the UCI Repository named "Cardiotocography". More information can be found here: https://archive.ics.uci.edu/ml/datasets/Cardiotocography. \
+
+2126 fetal cardiotocograms (CTGs) were automatically processed and the respective diagnostic features measured. The CTGs were also classified by three expert obstetricians and a consensus classification label assigned to each of them. Classification was both with respect to a morphologic pattern (A, B, C ...) and to a fetal state (Normal, Suspicious, Pathologic). Therefore the dataset can be used either for 10-class or 3-class experiments.
+
+<br>
+
+```{r zero.1, results='hide'}
+# path to data
+file.path <- "https://archive.ics.uci.edu/ml/machine-learning-databases/00193/CTG.xls"
+# download data
+GET(url = file.path, write_disk(tf <- tempfile(fileext = ".xls")))
+# import into R
+raw.data <- read_excel(tf, sheet = 3)
+# remove unncessary variables
+rm("file.path", "tf")
+```
+
+```{r zero.2}
+# remove rows with missing data and irrelevant columns
+raw.data <- na.omit(raw.data) %>% .[,-c(1:6,18,29:38)]
+```
+
+```{r zero.3}
+# dimensions of data
+# should have 2126 obserbations, 21 predictors, and 2 outcomes
+dim(raw.data)
+```
+
+<br>
+
+##### Predictor Information
+
+```{r zero.4}
+# predictor (1:23) and outcome (24:25) names
+colnames(raw.data)
+```
+
+LB        - FHR baseline (beats per minute) \
+AC        - # of accelerations per second \
+FM        - # of fetal movements per second \
+UC        - # of uterine contractions per second \
+ASTV      - percentage of time with abnormal short term variability \
+MSTV      - mean value of short term variability \
+ALTV      - percentage of time with abnormal long term variability \
+MLTV      - mean value of long term variability \
+DL        - # of light decelerations per second \
+DS        - # of severe decelerations per second \
+DP        - # of prolongued decelerations per second \
+Width     - width of FHR histogram \
+Min       - minimum of FHR histogram \
+Max       - Maximum of FHR histogram \
+Nmax      - # of histogram peaks \
+Nzeros    - # of histogram zeros \
+Mode      - histogram mode \
+Mean      - histogram mean \
+Median    - histogram median \
+Variance  - histogram variance \
+Tendency  - histogram tendency
+
+<br>
+
+##### Outcome Information
+
+NSP - fetal state class code (N = 1 = normal; S = 2 = suspect; P = 3 = pathologic)
+
+```{r zero.5}
+# number and proportion of NSP (3-classes) observations
+kable(
+  raw.data %>%
+  group_by(NSP) %>%
+  summarise(count = sum(NSP)) %>%
+  mutate(count = count/NSP) %>%
+  mutate(percentage = count*100/sum(count))
+)
+```
+
+There are many 1 (Normal) observations and few 3 (Pathologic) observations.\
+\
+CLASS - Fetal Heart Rate (FHR) pattern class code (1 to 10)
+
+1 = calm sleep \
+2 = REM sleep \
+3 = calm vigilance \
+4 = active vigilance \
+5 = shift pattern (A or Susp with shifts) \
+6 = accelerative/decelerative pattern (stress situation) \
+7 = decelerative pattern (vagal stimulation) \
+8 = largely decelerative pattern \
+9 = largely decelerative pattern \
+10 = suspect pattern 
+\
+\
+
+```{r zero.6}
+# number and percentage of CLASS (10-classes) observations
+kable(
+  raw.data %>%
+  group_by(CLASS) %>%
+  summarise(count = sum(CLASS)) %>%
+  mutate(count = count/CLASS) %>%
+  mutate(percentage = count*100/sum(count))
+)
+```
+
+CLASS observations of 1,2,6,7,10 have the most observations. \
+\
+
+```{r zero.7}
+# relationship between CLASS (10-classes) and NSP (3-classes)
+raw.data %>%
+  group_by(CLASS) %>%
+  summarise(NORMAL = sum(NSP == 1),
+            SUSPECT = sum(NSP == 2),
+            PATHOLOGIC = sum(NSP == 3)) %>%
+  gather(., NSP, count, -1) %>%
+  ggplot(data = ., mapping = aes(x = CLASS, y = count, fill = NSP)) +
+    geom_bar(stat = "identity") +
+    xlim("1","2","3","4","5","6","7","8","9","10")
+```
+
+Lower CLASS values are associated with "normal" NSP ratings while higher CLASS values are associated with "pathologic" NSP ratings. "Suspect" NSP ratings do not show a strong relationship with CLASS (many classified as 5,7,10).
+
+<br>
+
+### Part 0
+
+##### Create training (60%), development (20%), and test sets (20%).
+
+```{r zero.8}
+# create copy of raw data
+df <- raw.data
+# factorize CLASS and NSP column data
+df$CLASS <- as.factor(df$CLASS)
+df$NSP <- as.factor(df$NSP)
+# vector of all 21 predictors
+inputs <- colnames(df)[1:21]
+```
+
+```{r zero.9}
+# split df by 80:20 for training and test set
+split1 <- sample(dim(df)[1], 0.8*dim(df)[1])
+train1 <- df[split1,]
+test   <- df[-split1,]
+```
+
+```{r zero.10}
+# split training set into 75:25 for train and development set
+split2 <- sample(dim(train1)[1], 0.75*dim(train1)[1])
+train  <- train1[split2,]
+dev    <- train1[-split2,]
+```
+
+```{r zero.11}
+# 1360 observations
+dim(train)
+# 425 observations
+dim(dev)
+# 426 observations
+dim(test)
+```
+
+<br>
+
+### Part 1 - CLASS (10-class) classification
+
+```{r one.0}
+# data for part 1
+train1 <- subset(train, select = -NSP)
+dev1   <- subset(dev, select = -NSP)
+test1  <- subset(test, select = -NSP)
+```
+
+```{r one.1}
+# create model formula
+mod1 <- as.formula(paste("CLASS ~", paste(inputs, collapse = " + ")))
+```
+
+##### Multinomial Logistic Regression with Grouped-Lasso Penalty (glmnet)
+https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html
+
+```{r one.2.0, warning='hide', message='hide'}
+# combine train and dev set to perform 10-fold cross-validation
+train11 <- rbind(train1, dev1)
+# train model to find best tuning parameter lambda
+logreg1 <- cv.glmnet(as.matrix(train11[,-22]), as.matrix(train11[,22]),
+                     family = "multinomial", type.multinomial = "grouped", nfolds = 5)
+# calculate predictions on test set
+logreg1.pred <- predict(logreg1, newx = as.matrix(test1[,-22]), s = "lambda.min", type = "class")
+```
+
+```{r one.2.1}
+# misclassification rate
+logreg1.error <- mean(logreg1.pred != test1[,22])
+# precision (macro-averaged)
+logreg1.precision <- (sum((logreg1.pred == test1[,22]) & (logreg1.pred == 1))/sum(logreg1.pred == 1) +
+                      sum((logreg1.pred == test1[,22]) & (logreg1.pred == 2))/sum(logreg1.pred == 2) +
+                      sum((logreg1.pred == test1[,22]) & (logreg1.pred == 3))/sum(logreg1.pred == 3) +
+                      sum((logreg1.pred == test1[,22]) & (logreg1.pred == 4))/sum(logreg1.pred == 4) +
+                      sum((logreg1.pred == test1[,22]) & (logreg1.pred == 5))/sum(logreg1.pred == 5) +
+                      sum((logreg1.pred == test1[,22]) & (logreg1.pred == 6))/sum(logreg1.pred == 6) +
+                      sum((logreg1.pred == test1[,22]) & (logreg1.pred == 7))/sum(logreg1.pred == 7) +
+                      sum((logreg1.pred == test1[,22]) & (logreg1.pred == 8))/sum(logreg1.pred == 8) +
+                      sum((logreg1.pred == test1[,22]) & (logreg1.pred == 9))/sum(logreg1.pred == 9) +
+                      sum((logreg1.pred == test1[,22]) & (logreg1.pred == 10))/sum(logreg1.pred == 10))/10
+# recall (macro-averaged)
+logreg1.recall <- (sum((logreg1.pred == test1[,22]) & (logreg1.pred == 1))/sum(test1[,22] == 1) +
+                   sum((logreg1.pred == test1[,22]) & (logreg1.pred == 2))/sum(test1[,22] == 2) +
+                   sum((logreg1.pred == test1[,22]) & (logreg1.pred == 3))/sum(test1[,22] == 3) +
+                   sum((logreg1.pred == test1[,22]) & (logreg1.pred == 4))/sum(test1[,22] == 4) +
+                   sum((logreg1.pred == test1[,22]) & (logreg1.pred == 5))/sum(test1[,22] == 5) +
+                   sum((logreg1.pred == test1[,22]) & (logreg1.pred == 6))/sum(test1[,22] == 6) +
+                   sum((logreg1.pred == test1[,22]) & (logreg1.pred == 7))/sum(test1[,22] == 7) +
+                   sum((logreg1.pred == test1[,22]) & (logreg1.pred == 8))/sum(test1[,22] == 8) +
+                   sum((logreg1.pred == test1[,22]) & (logreg1.pred == 9))/sum(test1[,22] == 9) +
+                   sum((logreg1.pred == test1[,22]) & (logreg1.pred == 10))/sum(test1[,22] == 10))/10
+# F1 score (macro-averaged)
+logreg1.f1 <- 2*logreg1.precision*logreg1.recall/(logreg1.precision+logreg1.recall)
+```
+
+##### Naive Bayes - Laplace Smoothing is not needed because all classes are observed in the training set
+
+```{r one.3.0}
+# create model
+nbayes1 <- naiveBayes(mod1, data = train11)
+# calculate predictions on test set
+nbayes1.pred <- predict(nbayes1, test1[,-22], type = "class")
+```
+
+```{r one.3.1}
+# misclassification rate
+nbayes1.error <- mean(nbayes1.pred != as.matrix(test1[,22]))
+# precision (macro-averaged)
+nbayes1.precision <- (sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 1))/sum(nbayes1.pred == 1) +
+                      sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 2))/sum(nbayes1.pred == 2) +
+                      sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 3))/sum(nbayes1.pred == 3) +
+                      sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 4))/sum(nbayes1.pred == 4) +
+                      sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 5))/sum(nbayes1.pred == 5) +
+                      sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 6))/sum(nbayes1.pred == 6) +
+                      sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 7))/sum(nbayes1.pred == 7) +
+                      sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 8))/sum(nbayes1.pred == 8) +
+                      sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 9))/sum(nbayes1.pred == 9) +
+                      sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 10))/sum(nbayes1.pred == 10))/10
+# recall (macro-averaged)
+nbayes1.recall <- (sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 1))/sum(test1[,22] == 1) +
+                   sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 2))/sum(test1[,22] == 2) +
+                   sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 3))/sum(test1[,22] == 3) +
+                   sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 4))/sum(test1[,22] == 4) +
+                   sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 5))/sum(test1[,22] == 5) +
+                   sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 6))/sum(test1[,22] == 6) +
+                   sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 7))/sum(test1[,22] == 7) +
+                   sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 8))/sum(test1[,22] == 8) +
+                   sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 9))/sum(test1[,22] == 9) +
+                   sum((nbayes1.pred == as.matrix(test1[,22])) & (nbayes1.pred == 10))/sum(test1[,22] == 10))/10
+# F1 score (macro-averaged)
+nbayes1.f1 <- 2*nbayes1.precision*nbayes1.recall/(nbayes1.precision+nbayes1.recall)
+```
+
+##### Random Forest - tune mtry (2,3,4,5,6,7,8,9) & nodesize (1,2,3,4,5)
+
+```{r one.4.0}
+# "mtry" tuning parameters
+mtry <- c(2:9)
+# "nodesize" tuning parameters
+nodesize <- c(1:5)
+# initialize test error input vector
+test.error <- c(rep(0,length(mtry)*length(nodesize)))
+# calculate test errors for random forest models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in mtry) {
+  m <- m+1
+  l <- 1
+  for (j in nodesize) {
+    # create model
+    randf <- randomForest(mod1, data = train1, ntree = 5000,
+                          mtry = mtry[m], nodesize = nodesize[l])
+    # calculate class probabilities
+    randf.pred <- predict(randf, dev1[,-22], type = "class")
+    # misclassification rate
+    test.error[k] <- mean(randf.pred != as.matrix(dev1[,22]))
+    k <- k+1
+    l <- l+1
+  }
+}
+dim(test.error) <- c(length(nodesize), length(mtry))
+rownames(test.error) <- nodesize
+colnames(test.error) <- mtry
+kable(test.error)
+```
+
+The best combination of mtry and nodesize is 6 and 2.
+
+```{r one.4.1}
+# create model
+randf1 <- randomForest(mod1, data = train1, ntree = 5000,
+                       mtry = 6, nodesize = 2)
+# calculate predictions on test set
+randf1.pred <- predict(randf1, test1[,-22], type = "class")
+```
+
+```{r one.4.2}
+# misclassification rate
+randf1.error <- mean(randf1.pred != as.matrix(test1[,22]))
+# precision (macro-averaged)
+randf1.precision <- (sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 1))/sum(randf1.pred == 1) +
+                     sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 2))/sum(randf1.pred == 2) +
+                     sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 3))/sum(randf1.pred == 3) +
+                     sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 4))/sum(randf1.pred == 4) +
+                     sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 5))/sum(randf1.pred == 5) +
+                     sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 6))/sum(randf1.pred == 6) +
+                     sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 7))/sum(randf1.pred == 7) +
+                     sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 8))/sum(randf1.pred == 8) +
+                     sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 9))/sum(randf1.pred == 9) +
+                     sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 10))/sum(randf1.pred == 10))/10
+# recall (macro-averaged)
+randf1.recall <- (sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 1))/sum(test1[,22] == 1) +
+                  sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 2))/sum(test1[,22] == 2) +
+                  sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 3))/sum(test1[,22] == 3) +
+                  sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 4))/sum(test1[,22] == 4) +
+                  sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 5))/sum(test1[,22] == 5) +
+                  sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 6))/sum(test1[,22] == 6) +
+                  sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 7))/sum(test1[,22] == 7) +
+                  sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 8))/sum(test1[,22] == 8) +
+                  sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 9))/sum(test1[,22] == 9) +
+                  sum((randf1.pred == as.matrix(test1[,22])) & (randf1.pred == 10))/sum(test1[,22] == 10))/10
+# F1 score (macro-averaged)
+randf1.f1 <- 2*randf1.precision*randf1.recall/(randf1.precision+randf1.recall)
+```
+
+##### Neural Network - size (60, 80, 100, 120, 140) & decay (0, 0.001, 0.01, 0.1)
+
+```{r one.5.0, echo=TRUE, results='hide'}
+# "size" tuning parameters
+size <- c(60, 80, 100, 120, 140)
+# "decay" tuning parameters
+decay <- c(0, 0.001, 0.01, 0.1)
+# initialize test error input vector
+test.error <- c(rep(0,length(size)*length(decay)))
+# calculate test errors for random forest models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in size) {
+  m <- m+1
+  l <- 1
+  for (j in decay) {
+    # create model
+    neural <- nnet(mod1, data = train1, size = size[m], decay = decay[l], MaxNWts = 10000)
+    # calculate class probabilities
+    neural.pred <- predict(neural, dev1[,-22], type = "class")
+    # misclassification rate
+    test.error[k] <- mean(neural.pred != dev1[,22])
+    k <- k+1
+    l <- l+1
+  }
+}
+```
+
+```{r one.5.1}
+dim(test.error) <- c(length(decay), length(size))
+rownames(test.error) <- decay
+colnames(test.error) <- size
+kable(test.error)
+```
+
+The best combination of nnodes and decay is 140 and 0.1.
+
+```{r one.5.2, echo=TRUE, results='hide'}
+# create model
+neural1 <- nnet(mod1, data = train1, size = 140, decay = 0.1, MaxNWts = 10000)
+# calculate predictions on test set
+neural1.pred <- predict(neural1, test1[,-22], type = "class")
+```
+
+```{r one.5.3}
+# misclassification rate
+neural1.error <- mean(neural1.pred != test1[,22])
+# precision (macro-averaged)
+neural1.precision <- (sum((neural1.pred == test1[,22]) & (neural1.pred == 1))/sum(neural1.pred == 1) +
+                      sum((neural1.pred == test1[,22]) & (neural1.pred == 2))/sum(neural1.pred == 2) +
+                      sum((neural1.pred == test1[,22]) & (neural1.pred == 3))/sum(neural1.pred == 3) +
+                      sum((neural1.pred == test1[,22]) & (neural1.pred == 4))/sum(neural1.pred == 4) +
+                      sum((neural1.pred == test1[,22]) & (neural1.pred == 5))/sum(neural1.pred == 5) +
+                      sum((neural1.pred == test1[,22]) & (neural1.pred == 6))/sum(neural1.pred == 6) +
+                      sum((neural1.pred == test1[,22]) & (neural1.pred == 7))/sum(neural1.pred == 7) +
+                      sum((neural1.pred == test1[,22]) & (neural1.pred == 8))/sum(neural1.pred == 8) +
+                      sum((neural1.pred == test1[,22]) & (neural1.pred == 9))/sum(neural1.pred == 9) +
+                      sum((neural1.pred == test1[,22]) & (neural1.pred == 10))/sum(neural1.pred == 10))/10
+# recall (macro-averaged)
+neural1.recall <- (sum((neural1.pred == test1[,22]) & (neural1.pred == 1))/sum(test1[,22] == 1) +
+                   sum((neural1.pred == test1[,22]) & (neural1.pred == 2))/sum(test1[,22] == 2) +
+                   sum((neural1.pred == test1[,22]) & (neural1.pred == 3))/sum(test1[,22] == 3) +
+                   sum((neural1.pred == test1[,22]) & (neural1.pred == 4))/sum(test1[,22] == 4) +
+                   sum((neural1.pred == test1[,22]) & (neural1.pred == 5))/sum(test1[,22] == 5) +
+                   sum((neural1.pred == test1[,22]) & (neural1.pred == 6))/sum(test1[,22] == 6) +
+                   sum((neural1.pred == test1[,22]) & (neural1.pred == 7))/sum(test1[,22] == 7) +
+                   sum((neural1.pred == test1[,22]) & (neural1.pred == 8))/sum(test1[,22] == 8) +
+                   sum((neural1.pred == test1[,22]) & (neural1.pred == 9))/sum(test1[,22] == 9) +
+                   sum((neural1.pred == test1[,22]) & (neural1.pred == 10))/sum(test1[,22] == 10))/10
+# F1 score (macro-averaged)
+neural1.f1 <- 2*neural1.precision*neural1.recall/(neural1.precision+neural1.recall)
+```
+
+##### Boosting - tune shrinkage (0, 0.001, 0.01, 0.1) & n.minobsinnode (1,2,3,4,5)
+
+```{r one.6.0}
+# "shrinkage" tuning parameters
+shrink <- c(0, 0.001, 0.01, 0.1)
+# "n.minobsinnode" tuning parameters
+minobs <- c(1:5)
+# initialize test error input vector
+test.error <- c(rep(0,length(shrink)*length(minobs)))
+# calculate test errors for boosting models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in shrink) {
+  m <- m+1
+  l <- 1
+  for (j in minobs) {
+    # create model
+    boost <- gbm(mod1, data = train1, distribution = "multinomial", n.trees = 5000,
+                 shrinkage = shrink[m], n.minobsinnode = minobs[l])
+    # calculate class probabilities
+    boost.prob <- predict(boost, n.trees = 5000, newdata = dev1[,-22], type = "response",
+                          shrinkage = shrink[m], n.minobsinnode = minobs[l])
+    # calculate predicted classes
+    boost.pred <- apply(boost.prob, 1, which.max)
+    # misclassification rate
+    test.error[k] <- mean(boost.pred != dev1[,22])
+    k <- k+1
+    l <- l+1
+  }
+}
+dim(test.error) <- c(length(minobs), length(shrink))
+rownames(test.error) <- minobs
+colnames(test.error) <- shrink
+kable(test.error)
+```
+
+The best combination of the shrinkage and n.minobsinnode is 0.1 and 5.
+
+```{r one.6.1}
+# create model
+boost1 <- gbm(mod1, data = train1, distribution = "multinomial", n.trees = 5000,
+              shrinkage = 0.1, n.minobsinnode = 5)
+# calculate class probabilities on test set
+boost1.prob <- predict(boost1, newdata = test1[,-22], n.trees = 5000, type = "response",
+                       shrinkage = 0.1, n.minobsinnode = 5)
+# calculate predictions on test set
+boost1.pred <- apply(boost1.prob, 1, which.max)
+```
+
+```{r one.6.2}
+# misclassification rate
+boost1.error <- mean(boost1.pred != test1[,22])
+# precision (macro-averaged)
+boost1.precision <- (sum((boost1.pred == test1[,22]) & (boost1.pred == 1))/sum(boost1.pred == 1) +
+                     sum((boost1.pred == test1[,22]) & (boost1.pred == 2))/sum(boost1.pred == 2) +
+                     sum((boost1.pred == test1[,22]) & (boost1.pred == 3))/sum(boost1.pred == 3) +
+                     sum((boost1.pred == test1[,22]) & (boost1.pred == 4))/sum(boost1.pred == 4) +
+                     sum((boost1.pred == test1[,22]) & (boost1.pred == 5))/sum(boost1.pred == 5) +
+                     sum((boost1.pred == test1[,22]) & (boost1.pred == 6))/sum(boost1.pred == 6) +
+                     sum((boost1.pred == test1[,22]) & (boost1.pred == 7))/sum(boost1.pred == 7) +
+                     sum((boost1.pred == test1[,22]) & (boost1.pred == 8))/sum(boost1.pred == 8) +
+                     sum((boost1.pred == test1[,22]) & (boost1.pred == 9))/sum(boost1.pred == 9) +
+                     sum((boost1.pred == test1[,22]) & (boost1.pred == 10))/sum(boost1.pred == 10))/10
+# recall (macro-averaged)
+boost1.recall <- (sum((boost1.pred == test1[,22]) & (boost1.pred == 1))/sum(test1[,22] == 1) +
+                  sum((boost1.pred == test1[,22]) & (boost1.pred == 2))/sum(test1[,22] == 2) +
+                  sum((boost1.pred == test1[,22]) & (boost1.pred == 3))/sum(test1[,22] == 3) +
+                  sum((boost1.pred == test1[,22]) & (boost1.pred == 4))/sum(test1[,22] == 4) +
+                  sum((boost1.pred == test1[,22]) & (boost1.pred == 5))/sum(test1[,22] == 5) +
+                  sum((boost1.pred == test1[,22]) & (boost1.pred == 6))/sum(test1[,22] == 6) +
+                  sum((boost1.pred == test1[,22]) & (boost1.pred == 7))/sum(test1[,22] == 7) +
+                  sum((boost1.pred == test1[,22]) & (boost1.pred == 8))/sum(test1[,22] == 8) +
+                  sum((boost1.pred == test1[,22]) & (boost1.pred == 9))/sum(test1[,22] == 9) +
+                  sum((boost1.pred == test1[,22]) & (boost1.pred == 10))/sum(test1[,22] == 10))/10
+# F1 score (macro-averaged)
+boost1.f1 <- 2*boost1.precision*boost1.recall/(boost1.precision+boost1.recall)
+```
+
+<br>
+
+### Part 2 - NSP (3-class) classification
+
+```{r two.0}
+# data for part 2
+train2 <- subset(train, select = -CLASS)
+dev2   <- subset(dev, select = -CLASS)
+test2  <- subset(test, select = -CLASS)
+```
+
+```{r two.1}
+# create model formula
+mod2 <- as.formula(paste("NSP ~", paste(inputs, collapse = " + ")))
+```
+
+##### Multinomial Logistic Regression with Grouped-Lasso Penalty
+
+```{r two.2.0}
+# combine train and dev set to perform 10-fold cross-validation
+train22 <- rbind(train2, dev2)
+# train model to find best tuning parameter lambda
+logreg2 <- cv.glmnet(as.matrix(train22[,-22]), as.matrix(train22[,22]),
+                     family = "multinomial", type.multinomial = "grouped", nfolds = 5)
+# calculate predictions on test set
+logreg2.pred <- predict(logreg2, newx = as.matrix(test2[,-22]), s = "lambda.min", type = "class")
+```
+
+```{r two.2.1}
+# misclassification rate
+logreg2.error <- mean(logreg2.pred != test2[,22])
+# precision (micro-averaged)
+logreg2.precision <- (sum((logreg2.pred == test2[,22]) & (logreg2.pred == 1))/sum(logreg2.pred == 1) +
+                      sum((logreg2.pred == test2[,22]) & (logreg2.pred == 2))/sum(logreg2.pred == 2) +
+                      sum((logreg2.pred == test2[,22]) & (logreg2.pred == 3))/sum(logreg2.pred == 3))/3
+# recall (micro-averaged)
+logreg2.recall <- (sum((logreg2.pred == test2[,22]) & (logreg2.pred == 1))/sum(test2[,22] == 1) +
+                   sum((logreg2.pred == test2[,22]) & (logreg2.pred == 2))/sum(test2[,22] == 2) +
+                   sum((logreg2.pred == test2[,22]) & (logreg2.pred == 3))/sum(test2[,22] == 3))/3
+# F1 score (micro-averaged)
+logreg2.f1 <-2*logreg2.precision*logreg2.recall/(logreg2.precision+logreg2.recall)
+```
+
+##### Naive Bayes
+
+```{r two.3.0}
+# create model
+nbayes2 <- naiveBayes(mod2, data = train22)
+# predict classes on test set
+nbayes2.pred <- predict(nbayes2, test2[,-22], type = "class")
+```
+
+```{r two.3.1}
+# misclassification rate
+nbayes2.error <- mean(nbayes2.pred != as.matrix(test2[,22]))
+# precision (macro-averaged)
+nbayes2.precision <- (sum((nbayes2.pred == as.matrix(test2[,22])) & (nbayes2.pred == 1))/sum(nbayes2.pred == 1) +
+                      sum((nbayes2.pred == as.matrix(test2[,22])) & (nbayes2.pred == 2))/sum(nbayes2.pred == 2) +
+                      sum((nbayes2.pred == as.matrix(test2[,22])) & (nbayes2.pred == 3))/sum(nbayes2.pred == 3))/3
+# recall (macro-averaged)
+nbayes2.recall <- (sum((nbayes2.pred == as.matrix(test2[,22])) & (nbayes2.pred == 1))/sum(test2[,22] == 1) +
+                   sum((nbayes2.pred == as.matrix(test2[,22])) & (nbayes2.pred == 2))/sum(test2[,22] == 2) +
+                   sum((nbayes2.pred == as.matrix(test2[,22])) & (nbayes2.pred == 3))/sum(test2[,22] == 3))/3
+# F1 score (macro-averaged)
+nbayes2.f1 <- 2*nbayes2.precision*nbayes2.recall/(nbayes2.precision+nbayes2.recall)
+```
+
+##### Random Forest
+
+```{r two.4.0}
+# "mtry" tuning parameters
+mtry <- c(2:9)
+# "nodesize" tuning parameters
+nodesize <- c(1:5)
+# initialize test error input vector
+test.error <- c(rep(0,length(mtry)*length(nodesize)))
+# calculate test errors for random forest models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in mtry) {
+  m <- m+1
+  l <- 1
+  for (j in nodesize) {
+    # create model
+    randf <- randomForest(mod2, data = train2, ntree = 5000,
+                          mtry = mtry[m], nodesize = nodesize[l])
+    # calculate class probabilities
+    randf.pred <- predict(randf, dev2[,-22], type = "class")
+    # misclassification rate
+    test.error[k] <- mean(randf.pred != as.matrix(dev2[,22]))
+    k <- k+1
+    l <- l+1
+  }
+}
+dim(test.error) <- c(length(nodesize), length(mtry))
+rownames(test.error) <- nodesize
+colnames(test.error) <- mtry
+kable(test.error)
+```
+
+The best combination of mtry and nodesize is 3 and 2.
+
+```{r two.4.1}
+# create model
+randf2 <- randomForest(mod2, data = train2, ntree = 5000,
+                       mtry = 3, nodesize = 2)
+# calculate predictions on test set
+randf2.pred <- predict(randf2, test2[,-22], type = "class")
+```
+
+```{r two.4.2}
+# misclassification rate
+randf2.error <- mean(randf2.pred != as.matrix(test2[,22]))
+# precision (macro-averaged)
+randf2.precision <- (sum((randf2.pred == as.matrix(test2[,22])) & (randf2.pred == 1))/sum(randf2.pred == 1) +
+                     sum((randf2.pred == as.matrix(test2[,22])) & (randf2.pred == 2))/sum(randf2.pred == 2) +
+                     sum((randf2.pred == as.matrix(test2[,22])) & (randf2.pred == 3))/sum(randf2.pred == 3))/3
+# recall (macro-averaged)
+randf2.recall <- (sum((randf2.pred == as.matrix(test2[,22])) & (randf2.pred == 1))/sum(test2[,22] == 1) +
+                  sum((randf2.pred == as.matrix(test2[,22])) & (randf2.pred == 2))/sum(test2[,22] == 2) +
+                  sum((randf2.pred == as.matrix(test2[,22])) & (randf2.pred == 3))/sum(test2[,22] == 3))/3
+# F1 score (macro-averaged)
+randf2.f1 <- 2*randf2.precision*randf2.recall/(randf2.precision+randf2.recall)
+```
+
+##### Neural Network
+
+```{r two.5.0, echo=TRUE, results='hide'}
+# "size" tuning parameters
+size <- c(60, 80, 100, 120, 140)
+# "decay" tuning parameters
+decay <- c(0, 0.001, 0.01, 0.1)
+# initialize test error input vector
+test.error <- c(rep(0,length(size)*length(decay)))
+# calculate test errors for random forest models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in size) {
+  m <- m+1
+  l <- 1
+  for (j in decay) {
+    # create model
+    neural <- nnet(mod2, data = train2, size = size[m], decay = decay[l], MaxNWts = 10000)
+    # calculate class probabilities
+    neural.pred <- predict(neural, dev2[,-22], type = "class")
+    # misclassification rate
+    test.error[k] <- mean(neural.pred != dev2[,22])
+    k <- k+1
+    l <- l+1
+  }
+}
+```
+
+```{r two.5.1}
+dim(test.error) <- c(length(decay), length(size))
+rownames(test.error) <- decay
+colnames(test.error) <- size
+kable(test.error)
+```
+
+The best combination of nnodes and decay is 120 and 0.1.
+
+```{r two.5.2, echo=TRUE, results='hide'}
+# create model
+neural2 <- nnet(mod2, data = train2, size = 120, decay = 0.1, MaxNWts = 10000)
+# calculate predictions on test set
+neural2.pred <- predict(neural2, test2[,-22], type = "class")
+```
+
+```{r two.5.3}
+# misclassification rate
+neural2.error <- mean(neural2.pred != test2[,22])
+# precision (macro-averaged)
+neural2.precision <- (sum((neural2.pred == test2[,22]) & (neural2.pred == 1))/sum(neural2.pred == 1) +
+                      sum((neural2.pred == test2[,22]) & (neural2.pred == 2))/sum(neural2.pred == 2) +
+                      sum((neural2.pred == test2[,22]) & (neural2.pred == 3))/sum(neural2.pred == 3))/3
+# recall (macro-averaged)
+neural2.recall <- (sum((neural2.pred == test2[,22]) & (neural2.pred == 1))/sum(test2[,22] == 1) +
+                   sum((neural2.pred == test2[,22]) & (neural2.pred == 2))/sum(test2[,22] == 2) +
+                   sum((neural2.pred == test2[,22]) & (neural2.pred == 3))/sum(test2[,22] == 3))/3
+# F1 score (macro-averaged)
+neural2.f1 <- 2*neural2.precision*neural2.recall/(neural2.precision+neural2.recall)
+```
+
+##### Boosting
+
+```{r two.6.0}
+# "shrinkage" tuning parameters
+shrink <- c(0, 0.001, 0.01, 0.1)
+# "n.minobsinnode" tuning parameters
+minobs <- c(1:5)
+# initialize test error input vector
+test.error <- c(rep(0,length(shrink)*length(minobs)))
+# calculate test errors for boosting models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in shrink) {
+  m <- m+1
+  l <- 1
+  for (j in minobs) {
+    # create model
+    boost <- gbm(mod2, data = train2, distribution = "multinomial", n.trees = 5000,
+                 shrinkage = shrink[m], n.minobsinnode = minobs[l])
+    # calculate class probabilities
+    boost.prob <- predict(boost, n.trees = 5000, newdata = dev2[,-22], type = "response",
+                          shrinkage = shrink[m], n.minobsinnode = minobs[l])
+    # calculate predicted classes
+    boost.pred <- apply(boost.prob, 1, which.max)
+    # misclassification rate
+    test.error[k] <- mean(boost.pred != dev2[,22])
+    k <- k+1
+    l <- l+1
+  }
+}
+dim(test.error) <- c(length(minobs), length(shrink))
+rownames(test.error) <- minobs
+colnames(test.error) <- shrink
+kable(test.error)
+```
+
+The best combination of the shrinkage and n.minobsinnode is 0.1 and 1.
+
+```{r two.6.1}
+# create model
+boost2 <- gbm(mod2, data = train2, distribution = "multinomial", n.trees = 5000,
+              shrinkage = 0.1, n.minobsinnode = 1)
+# calculate class probabilities on test set
+boost2.prob <- predict(boost2, newdata = test2[,-22], n.trees = 5000, type = "response",
+                       shrinkage = 0.1, n.minobsinnode = 1)
+# calculate predictions on test set
+boost2.pred <- apply(boost2.prob, 1, which.max)
+```
+
+```{r two.6.2}
+# misclassification rate
+boost2.error <- mean(boost2.pred != test2[,22])
+# precision (macro-averaged)
+boost2.precision <- (sum((boost2.pred == test2[,22]) & (boost2.pred == 1))/sum(boost2.pred == 1) +
+                     sum((boost2.pred == test2[,22]) & (boost2.pred == 2))/sum(boost2.pred == 2) +
+                     sum((boost2.pred == test2[,22]) & (boost2.pred == 3))/sum(boost2.pred == 3))/3
+# recall (macro-averaged)
+boost2.recall <- (sum((boost2.pred == test2[,22]) & (boost2.pred == 1))/sum(test2[,22] == 1) +
+                  sum((boost2.pred == test2[,22]) & (boost2.pred == 2))/sum(test2[,22] == 2) +
+                  sum((boost2.pred == test2[,22]) & (boost2.pred == 3))/sum(test2[,22] == 3))/3
+# F1 score (macro-averaged)
+boost2.f1 <- 2*boost2.precision*boost2.recall/(boost2.precision+boost2.recall)
+```
+
+<br>
+
+### Part 3 - NSP (2-class) classification : Suspect (2) coded as Normal (1)
+
+```{r three.0}
+# data for part 3
+train3 <- train2
+dev3   <- dev2
+test3  <- test2
+# combine NSP = 1 and NSP = 2 into one level
+train3$NSP <- as.factor(ifelse(train3$NSP %in% c("1","2"), 0, 1))
+dev3$NSP   <- as.factor(ifelse(dev3$NSP %in% c("1","2"), 0, 1))
+test3$NSP  <- as.factor(ifelse(test3$NSP %in% c("1","2"), 0, 1))
+```
+
+```{r three.1}
+# create model formula
+mod3 <- mod2
+```
+
+##### Logistic Regresssion with Elastic Net Penalization
+
+```{r three.2.0}
+# combine train and dev set to perform 10-fold cross-validation
+train33 <- rbind(train3, dev3)
+# train model to find best tuning parameter lambda
+logreg3 <- cv.glmnet(as.matrix(train33[,-22]), as.matrix(train33[,22]),
+                     family = "binomial", nfolds = 5)
+# calculate predictions on test set
+logreg3.pred <- predict(logreg3, newx = as.matrix(test3[,-22]), s = "lambda.min", type = "class")
+```
+
+```{r three.2.1}
+# misclassification rate
+logreg3.error <- mean(logreg3.pred != test3[,22])
+# precision
+logreg3.precision <- sum((logreg3.pred == test3[,22]) & (logreg3.pred == 1))/sum(logreg3.pred == 1)
+# recall
+logreg3.recall <- sum((logreg3.pred == test3[,22]) & (logreg3.pred == 1))/sum(test3[,22] == 1)
+# F1 score
+logreg3.f1 <- 2*logreg3.precision*logreg3.recall/(logreg3.precision+logreg3.recall)
+```
+
+##### Naive Bayes
+
+```{r three.3.0}
+# create model
+nbayes3 <- naiveBayes(mod3, data = train33)
+# predict classes on test set
+nbayes3.pred <- predict(nbayes3, test3[,-22], type = "class")
+```
+
+```{r three.3.1}
+# misclassification rate
+nbayes3.error <- mean(nbayes3.pred != as.matrix(test3[,22]))
+# precision
+nbayes3.precision <- sum((nbayes3.pred == as.matrix(test3[,22])) & (nbayes3.pred == 1))/sum(nbayes3.pred == 1)
+# recall
+nbayes3.recall <- sum((nbayes3.pred == as.matrix(test3[,22])) & (nbayes3.pred == 1))/sum(test3[,22] == 1)
+# F1 score
+nbayes3.f1 <- 2*nbayes3.precision*nbayes3.recall/(nbayes3.precision+nbayes3.recall)
+```
+
+##### Random Forest
+
+```{r three.4.0}
+# "mtry" tuning parameters
+mtry <- c(2:9)
+# "nodesize" tuning parameters
+nodesize <- c(1:5)
+# initialize test error input vector
+test.error <- c(rep(0,length(mtry)*length(nodesize)))
+# calculate test errors for random forest models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in mtry) {
+  m <- m+1
+  l <- 1
+  for (j in nodesize) {
+    # create model
+    randf <- randomForest(mod3, data = train3, ntree = 5000,
+                          mtry = mtry[m], nodesize = nodesize[l])
+    # calculate class probabilities
+    randf.pred <- predict(randf, dev3[,-22], type = "class")
+    # misclassification rate
+    test.error[k] <- mean(randf.pred != as.matrix(dev3[,22]))
+    k <- k+1
+    l <- l+1
+  }
+}
+dim(test.error) <- c(length(nodesize), length(mtry))
+rownames(test.error) <- nodesize
+colnames(test.error) <- mtry
+kable(test.error)
+```
+
+The best combination of mtry and nodesize is 3 and 5.
+
+```{r three.4.1}
+# create model
+randf3 <- randomForest(mod3, data = train3, ntree = 5000,
+                       mtry = 3, nodesize = 5)
+# calculate predictions on test set
+randf3.pred <- predict(randf3, test3[,-22], type = "class")
+```
+
+```{r three.4.2}
+# misclassification rate
+randf3.error <- mean(randf3.pred != as.matrix(test3[,22]))
+# precision
+randf3.precision <- sum((randf3.pred == as.matrix(test3[,22])) & (randf3.pred == 1))/sum(randf3.pred == 1)
+# recall
+randf3.recall <- sum((randf3.pred == as.matrix(test3[,22])) & (randf3.pred == 1))/sum(test3[,22] == 1)
+# F1 score
+randf3.f1 <- 2*randf3.precision*randf3.recall/(randf3.precision+randf3.recall)
+```
+
+##### Neural Network
+
+```{r three.5.0, echo=TRUE, results='hide'}
+# "size" tuning parameters
+size <- c(60, 80, 100, 120, 140)
+# "decay" tuning parameters
+decay <- c(0, 0.001, 0.01, 0.1)
+# initialize test error input vector
+test.error <- c(rep(0,length(size)*length(decay)))
+# calculate test errors for random forest models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in size) {
+  m <- m+1
+  l <- 1
+  for (j in decay) {
+    # create model
+    neural <- nnet(mod3, data = train3, size = size[m], decay = decay[l], MaxNWts = 10000)
+    # calculate class probabilities
+    neural.pred <- predict(neural, dev3[,-22], type = "class")
+    # misclassification rate
+    test.error[k] <- mean(neural.pred != dev3[,22])
+    k <- k+1
+    l <- l+1
+  }
+}
+```
+
+```{r three.5.1}
+dim(test.error) <- c(length(decay), length(size))
+rownames(test.error) <- decay
+colnames(test.error) <- size
+kable(test.error)
+```
+
+The best combination of nnodes and decay is 80 and 0.1.
+
+```{r three.5.2, echo=TRUE, results='hide'}
+# create model
+neural3 <- nnet(mod3, data = train3, size = 80, decay = 0.1, MaxNWts = 10000)
+# calculate predictions on test set
+neural3.pred <- predict(neural3, test3[,-22], type = "class")
+```
+
+```{r three.5.3}
+# misclassification rate
+neural3.error <- mean(neural3.pred != test3[,22])
+# precision
+neural3.precision <- sum((neural3.pred == test3[,22]) & (neural3.pred == 1))/sum(neural3.pred == 1)
+# recall
+neural3.recall <- sum((neural3.pred == test3[,22]) & (neural3.pred == 1))/sum(test3[,22] == 1)
+# F1 score
+neural3.f1 <- 2*neural3.precision*neural3.recall/(neural3.precision+neural3.recall)
+```
+
+##### Boosting
+
+```{r three.6.0}
+# change factor to character for gbm
+train3$NSP <- as.character(train3$NSP)
+dev3$NSP <- as.character(dev3$NSP)
+test3$NSP <- as.character(test3$NSP)
+```
+
+```{r three.6.1}
+# "shrinkage" tuning parameters
+shrink <- c(0, 0.001, 0.01, 0.1)
+# "n.minobsinnode" tuning parameters
+minobs <- c(1:5)
+# initialize test error input vector
+test.error <- c(rep(0,length(shrink)*length(minobs)))
+# calculate test errors for boosting models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in shrink) {
+  m <- m+1
+  l <- 1
+  for (j in minobs) {
+    # create model
+    boost <- gbm(mod3, data = train3, distribution = "bernoulli", n.trees = 5000,
+                 shrinkage = shrink[m], n.minobsinnode = minobs[l])
+    # calculate class probabilities
+    boost.prob <- predict(boost, n.trees = 5000, newdata = dev3[,-22], type = "response",
+                          shrinkage = shrink[m], n.minobsinnode = minobs[l])
+    # calculate predicted classes
+    boost.pred <- round(boost.prob)
+    # misclassification rate
+    test.error[k] <- mean(boost.pred != dev3[,22])
+    k <- k+1
+    l <- l+1
+  }
+}
+dim(test.error) <- c(length(minobs), length(shrink))
+rownames(test.error) <- minobs
+colnames(test.error) <- shrink
+kable(test.error)
+```
+
+The best combination of the shrinkage and n.minobsinnode is 0.01 and 2.
+
+```{r three.6.2}
+# create model
+boost3 <- gbm(mod3, data = train3, distribution = "bernoulli", n.trees = 5000,
+              shrinkage = 0.01, n.minobsinnode = 2)
+# calculate class probabilities on test set
+boost3.prob <- predict(boost3, newdata = test3[,-22], n.trees = 5000, type = "response",
+                       shrinkage = 0.01, n.minobsinnode = 2)
+# calculate predictions on test set
+boost3.pred <- round(boost3.prob)
+```
+
+```{r three.6.3}
+# misclassification rate
+boost3.error <- mean(boost3.pred != test3[,22])
+# precision
+boost3.precision <- sum((boost3.pred == test3[,22]) & (boost3.pred == "1"))/sum(boost3.pred == "1")
+# recall
+boost3.recall <- sum((boost3.pred == test3[,22]) & (boost3.pred == 1))/sum(test3[,22] == 1)
+# F1 score
+boost3.f1 <- 2*boost3.precision*boost3.recall/(boost3.precision+boost3.recall)
+```
+
+<br>
+
+### Part 4 - NSP (2-class) classification : Suspect (2) coded as Pathological (3)
+
+```{r four.0}
+# data for part 4
+train4 <- train2
+dev4   <- dev2
+test4  <- test2
+# combine NSP = 1 and NSP = 2 into one level
+train4$NSP <- as.factor(ifelse(train4$NSP %in% c("1"), 0, 1))
+dev4$NSP   <- as.factor(ifelse(dev4$NSP %in% c("1"), 0, 1))
+test4$NSP  <- as.factor(ifelse(test4$NSP %in% c("1"), 0, 1))
+```
+
+```{r four.1}
+# create model formula
+mod4 <- mod2
+```
+
+##### Logistic Regression with Elastic Net Penalization
+
+```{r four.2.0}
+# combine train and dev set to perform 10-fold cross-validation
+train44 <- rbind(train4, dev4)
+# train model to find best tuning parameter lambda
+logreg4 <- cv.glmnet(as.matrix(train44[,-22]), as.matrix(train44[,22]),
+                     family = "binomial", nfolds = 5)
+# calculate predictions on test set
+logreg4.pred <- predict(logreg4, newx = as.matrix(test4[,-22]), s = "lambda.min", type = "class")
+```
+
+```{r four.2.1}
+# misclassification rate
+logreg4.error <- mean(logreg4.pred != test4[,22])
+# precision
+logreg4.precision <- sum((logreg4.pred == test4[,22]) & (logreg4.pred == 1))/sum(logreg4.pred == 1)
+# recall
+logreg4.recall <- sum((logreg4.pred == test4[,22]) & (logreg4.pred == 1))/sum(test4[,22] == 1)
+# F1 score
+logreg4.f1 <- 2*logreg4.precision*logreg4.recall/(logreg4.precision+logreg4.recall)
+```
+
+##### Naive Bayes
+
+```{r four.3.0}
+# create model
+nbayes4 <- naiveBayes(mod4, data = train44)
+# predict classes on test set
+nbayes4.pred <- predict(nbayes4, test4[,-22], type = "class")
+```
+
+```{r four.3.1}
+# misclassification rate
+nbayes4.error <- mean(nbayes4.pred != as.matrix(test4[,22]))
+# precision
+nbayes4.precision <- sum((nbayes4.pred == as.matrix(test4[,22])) & (nbayes4.pred == 1))/sum(nbayes4.pred == 1)
+# recall
+nbayes4.recall <- sum((nbayes4.pred == as.matrix(test4[,22])) & (nbayes4.pred == 1))/sum(test4[,22] == 1)
+# F1 score
+nbayes4.f1 <- 2*nbayes4.precision*nbayes4.recall/(nbayes4.precision+nbayes4.recall)
+```
+
+##### Random Forest
+
+```{r four.4.0}
+# "mtry" tuning parameters
+mtry <- c(2:9)
+# "nodesize" tuning parameters
+nodesize <- c(1:5)
+# initialize test error input vector
+test.error <- c(rep(0,length(mtry)*length(nodesize)))
+# calculate test errors for random forest models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in mtry) {
+  m <- m+1
+  l <- 1
+  for (j in nodesize) {
+    # create model
+    randf <- randomForest(mod4, data = train4, ntree = 5000,
+                          mtry = mtry[m], nodesize = nodesize[l])
+    # calculate class probabilities
+    randf.pred <- predict(randf, dev4[,-22], type = "class")
+    # misclassification rate
+    test.error[k] <- mean(randf.pred != as.matrix(dev4[,22]))
+    k <- k+1
+    l <- l+1
+  }
+}
+dim(test.error) <- c(length(nodesize), length(mtry))
+rownames(test.error) <- nodesize
+colnames(test.error) <- mtry
+kable(test.error)
+```
+
+Best combination of mtry and nodesize is 7 and 1.
+
+```{r four.4.1}
+# create model
+randf4 <- randomForest(mod4, data = train4, ntree = 5000,
+                       mtry = 7, nodesize = 1)
+# calculate predictions on test set
+randf4.pred <- predict(randf4, test4[,-22], type = "class")
+```
+
+```{r four.4.2}
+# misclassification rate
+randf4.error <- mean(randf4.pred != as.matrix(test4[,22]))
+# precision
+randf4.precision <- sum((randf4.pred == as.matrix(test4[,22])) & (randf4.pred == 1))/sum(randf4.pred == 1)
+# recall
+randf4.recall <- sum((randf4.pred == as.matrix(test4[,22])) & (randf4.pred == 1))/sum(test4[,22] == 1)
+# F1 score
+randf4.f1 <- 2*randf4.precision*randf4.recall/(randf4.precision+randf4.recall)
+```
+
+##### Neural Network
+
+```{r four.5.0, echo=TRUE, results='hide'}
+# "size" tuning parameters
+size <- c(60, 80, 100, 120, 140)
+# "decay" tuning parameters
+decay <- c(0, 0.001, 0.01, 0.1)
+# initialize test error input vector
+test.error <- c(rep(0,length(size)*length(decay)))
+# calculate test errors for random forest models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in size) {
+  m <- m+1
+  l <- 1
+  for (j in decay) {
+    # create model
+    neural <- nnet(mod4, data = train4, size = size[m], decay = decay[l], MaxNWts = 10000)
+    # calculate class probabilities
+    neural.pred <- predict(neural, dev4[,-22], type = "class")
+    # misclassification rate
+    test.error[k] <- mean(neural.pred != dev4[,22])
+    k <- k+1
+    l <- l+1
+  }
+}
+```
+
+```{r four.5.1}
+dim(test.error) <- c(length(decay), length(size))
+rownames(test.error) <- decay
+colnames(test.error) <- size
+kable(test.error)
+```
+
+The best combination of nnodes and decay is 80 and 0
+
+```{r four.5.2, echo=TRUE, results='hide'}
+# create model
+neural4 <- nnet(mod4, data = train4, size = 80, decay = 0, MaxNWts = 10000)
+# calculate predictions on test set
+neural4.pred <- predict(neural4, test4[,-22], type = "class")
+```
+
+```{r four.5.3}
+# misclassification rate
+neural4.error <- mean(neural4.pred != test4[,22])
+# precision
+neural4.precision <- sum((neural4.pred == test4[,22]) & (neural4.pred == 1))/sum(neural4.pred == 1)
+# recall
+neural4.recall <- sum((neural4.pred == test4[,22]) & (neural4.pred == 1))/sum(test4[,22] == 1)
+# F1 score
+neural4.f1 <- 2*neural4.precision*neural4.recall/(neural4.precision+neural4.recall)
+```
+
+##### Boosting
+
+```{r four.6.0}
+# change factor to character for gbm
+train4$NSP <- as.character(train4$NSP)
+dev4$NSP <- as.character(dev4$NSP)
+test4$NSP <- as.character(test4$NSP)
+```
+
+```{r four.6.1}
+# "shrinkage" tuning parameters
+shrink <- c(0, 0.001, 0.01, 0.1)
+# "n.minobsinnode" tuning parameters
+minobs <- c(1:5)
+# initialize test error input vector
+test.error <- c(rep(0,length(shrink)*length(minobs)))
+# calculate test errors for boosting models with different combinations of tuning parameters
+k <- 1
+l <- 1
+m <- 0
+for (i in shrink) {
+  m <- m+1
+  l <- 1
+  for (j in minobs) {
+    # create model
+    boost <- gbm(mod4, data = train4, distribution = "bernoulli", n.trees = 5000,
+                 shrinkage = shrink[m], n.minobsinnode = minobs[l])
+    # calculate class probabilities
+    boost.prob <- predict(boost, n.trees = 5000, newdata = dev4[,-22], type = "response",
+                          shrinkage = shrink[m], n.minobsinnode = minobs[l])
+    # calculate predicted classes
+    boost.pred <- round(boost.prob)
+    # misclassification rate
+    test.error[k] <- mean(boost.pred != dev4[,22])
+    k <- k+1
+    l <- l+1
+  }
+}
+dim(test.error) <- c(length(minobs), length(shrink))
+rownames(test.error) <- minobs
+colnames(test.error) <- shrink
+kable(test.error)
+```
+
+The best combination of the shrinkage and n.minobsinnode is 0.1 and 1.
+
+```{r four.6.2}
+# create model
+boost4 <- gbm(mod4, data = train4, distribution = "bernoulli", n.trees = 5000,
+              shrinkage = 0.1, n.minobsinnode = 1)
+# calculate class probabilities on test set
+boost4.prob <- predict(boost4, newdata = test4[,-22], n.trees = 5000, type = "response",
+                       shrinkage = 0.1, n.minobsinnode = 1)
+# calculate predictions on test set
+boost4.pred <- round(boost4.prob)
+```
+
+```{r four.6.3}
+# misclassification rate
+boost4.error <- mean(boost4.pred != test4[,22])
+# precision
+boost4.precision <- sum((boost4.pred == test4[,22]) & (boost4.pred == 1))/sum(boost4.pred == 1)
+# recall
+boost4.recall <- sum((boost4.pred == test4[,22]) & (boost4.pred == 1))/sum(test4[,22] == 1)
+# F1 score
+boost4.f1 <- 2*boost4.precision*boost4.recall/(boost4.precision+boost4.recall)
+```
+
+<br>
+
+### Summary
+
+##### Create Results DataFrames
+
+```{r five.0}
+error <- as.data.frame(matrix(c(logreg1.error, logreg2.error, logreg3.error, logreg4.error,
+                                    nbayes1.error, nbayes2.error, nbayes3.error, nbayes4.error,
+                                    randf1.error,  randf2.error,  randf3.error,  randf4.error,
+                                    neural1.error, neural2.error, neural3.error, neural4.error,
+                                    boost1.error,  boost2.error,  boost3.error,  boost4.error),
+                              nrow = 4))
+precision <- as.data.frame(matrix(c(logreg1.precision, logreg2.precision, logreg3.precision, logreg4.precision,
+                                    nbayes1.precision, nbayes2.precision, nbayes3.precision, nbayes4.precision,
+                                    randf1.precision,  randf2.precision,  randf3.precision,  randf4.precision,
+                                    neural1.precision, neural2.precision, neural3.precision, neural4.precision,
+                                    boost1.precision,  boost2.precision,  boost3.precision,  boost4.precision),
+                                  nrow = 4))
+recall <- as.data.frame(matrix(c(logreg1.recall, logreg2.recall, logreg3.recall, logreg4.recall,
+                                 nbayes1.recall, nbayes2.recall, nbayes3.recall, nbayes4.recall,
+                                 randf1.recall,  randf2.recall,  randf3.recall,  randf4.recall,
+                                 neural1.recall, neural2.recall, neural3.recall, neural4.recall,
+                                 boost1.recall,  boost2.recall,  boost3.recall,  boost4.recall),
+                               nrow = 4))
+f1 <- as.data.frame(matrix(c(logreg1.f1, logreg2.f1, logreg3.f1, logreg4.f1,
+                             nbayes1.f1, nbayes2.f1, nbayes3.f1, nbayes4.f1,
+                             randf1.f1,  randf2.f1,  randf3.f1,  randf4.f1,
+                             neural1.f1, neural2.f1, neural3.f1, neural4.f1,
+                             boost1.f1,  boost2.f1,  boost3.f1,  boost4.f1),
+                           nrow = 4))
+colnames(error) <- c("LogReg", "NaiveBayes", "RandForest", "NeuralNet", "Boosting")
+colnames(precision) <- c("LogReg", "NaiveBayes", "RandForest", "NeuralNet", "Boosting")
+colnames(recall) <- c("LogReg", "NaiveBayes", "RandForest", "NeuralNet", "Boosting")
+colnames(f1) <- c("LogReg", "NaiveBayes", "RandForest", "NeuralNet", "Boosting")
+```
+
+
+##### Comparing 10-Class vs 3-Class Classification Scheme
+
+```{r five.0}
+# error
+kable(error[1:2,])
+```
+
+```{r five.1}
+# precision
+kable(precision[1:2,])
+```
+
+```{r five.2}
+# recall
+kable(recall[1:2,])
+```
+
+```{r five.3}
+# f1 score
+kable(f1[1:2,])
+```
+
+The 3-class (NSP) classification schedule outperforms the 10-class (CLASS) classification scheme on all measures. The models that produce the most accuracte estimates (in order from best to worst) are Random Forest, Boosting, Logistic Regression, Neural Network, Naive Bayes.
+
+##### Exploring Validity of 2=Suspect Rating in 3-Class Scheme
+
+```{r five.4}
+# error
+kable(error[2:4,])
+```
+
+```{r five.5}
+# precision
+kable(precision[2:4,])
+```
+
+```{r five.6}
+# recall
+kable(recall[2:4,])
+```
+
+```{r five.7}
+# f1 score
+kable(f1[2:4,])
+```
+
+The 2-class (Suspect coded as Normal) model produced the best estimates compared to 3-class (NSP) and 2-class (Suspect coded as Pathologic). The models that produce the most accuracte estimates (in order from best to worst) are Random Forest, Boosting, Logistic Regression, Neural Network, Naive Bayes.
